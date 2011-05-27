@@ -24,15 +24,17 @@
 #include "libssh2.h"
 #include "libssh2_config.h"
 #include "libssh2_sftp.h"
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
-
-unsigned long hostaddr;
 int sock;
-struct sockaddr_in soin;
 LIBSSH2_SESSION *session;
 LIBSSH2_CHANNEL *channel;
+const char *keyfile1="id_rsa.pub"; // not working, yet
+const char *keyfile2="id_rsa"; // not working, yet
+
 int rc;
 
 static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
@@ -65,49 +67,144 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
     return rc;
 }
 
+char *passwordFunc(const char *s)
+{
+    static char *pw = NULL;
+    if (strlen(s)) {
+        pw = s;
+    } 
+    return pw;
+}
+
+void keyboard_interactive(const char *name, int name_len, const char *instr, int instr_len, 
+                          int num_prompts, const LIBSSH2_USERAUTH_KBDINT_PROMPT *prompts, LIBSSH2_USERAUTH_KBDINT_RESPONSE *res, 
+                          void **abstract)
+{
+    res[0].text = strdup(passwordFunc(""));
+    res[0].length = strlen(passwordFunc(""));
+}
+
 @implementation SSHWrapper
 
 -(int) connectToHost:(NSString *)host port:(int)port user:(NSString *)user password:(NSString *)password {
 	const char* hostChar = [host cStringUsingEncoding:NSUTF8StringEncoding];
 	const char* userChar = [user cStringUsingEncoding:NSUTF8StringEncoding];
 	const char* passwordChar = [password cStringUsingEncoding:NSUTF8StringEncoding];
+    char *userAuthList;
+    const char *cause = NULL;
+    const char *fingerprint;
+    int i, error, auth_pw = 0;
+    struct addrinfo hints, *res, *res0;
 
-    hostaddr = inet_addr(hostChar);
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    soin.sin_family = AF_INET;
-    soin.sin_port = htons(port);
-    soin.sin_addr.s_addr = hostaddr;
-    if (connect(sock, (struct sockaddr*)(&soin),sizeof(struct sockaddr_in)) != 0) {
-        fprintf(stderr, "failed to connect!\n");
-        return -1;
+    (void) passwordFunc(passwordChar); /* save for future use */
+    
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = PF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    error = getaddrinfo(hostChar, "ssh", &hints, &res0);
+    if (error) {
+        fprintf(stderr, "%s", gai_strerror(error));
+        return 1;
+        /*NOTREACHED*/
     }
-	
+    sock = -1;
+    for (res = res0; res; res = res->ai_next) {
+        sock = socket(res->ai_family, res->ai_socktype,
+                   res->ai_protocol);
+        if (sock < 0) {
+            cause = "socket";
+            continue;
+        }
+        
+        if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+            cause = "connect";
+            close(sock);
+            sock = -1;
+            continue;
+        }
+        
+        break;  /* okay we got one */
+    }
+    if (sock < 0) {
+        fprintf(stderr, "%s", cause);
+        return 1;
+        /*NOTREACHED*/
+    }
+    freeaddrinfo(res0);
+    
     /* Create a session instance */
     session = libssh2_session_init();
     if (!session)
         return -1;
-	
+    
+    // libssh2_trace(session, LIBSSH2_TRACE_AUTH|LIBSSH2_TRACE_ERROR);
+   
     /* tell libssh2 we want it all done non-blocking */
     libssh2_session_set_blocking(session, 0);
 	
     /* ... start it up. This will trade welcome banners, exchange keys,
      * and setup crypto, compression, and MAC layers
      */
-    while ((rc = libssh2_session_startup(session, sock)) ==
-           LIBSSH2_ERROR_EAGAIN);
+    while ((rc = libssh2_session_startup(session, sock)) == LIBSSH2_ERROR_EAGAIN)
+        ;
     if (rc) {
         fprintf(stderr, "Failure establishing SSH session: %d\n", rc);
         return -1;
     }
+    
+    fingerprint = libssh2_hostkey_hash(session, LIBSSH2_HOSTKEY_HASH_MD5);
+    
+    // XXX track this, display in an alert if we've not seen it before
+    printf("Fingerprint: ");
+    for(i = 0; i < 16; i++) {
+        printf("%02X:", (unsigned char)fingerprint[i]);
+    }
+    printf("\n");
+    
+    libssh2_session_set_blocking(session, 1);
+    userAuthList = libssh2_userauth_list(session, userChar, strlen(userChar)); 
+    
+    if (strstr(userAuthList, "password") != NULL) {
+        auth_pw |= 1;
+    }
+    if (strstr(userAuthList, "keyboard-interactive") != NULL) {
+        auth_pw |= 2;
+    }
+    if (strstr(userAuthList, "publickey") != NULL) {
+        auth_pw |= 4;
+    }
 
-    if ( strlen(passwordChar) != 0 ) {
-		/* We could authenticate via password */
-        while ((rc = libssh2_userauth_password(session, userChar, passwordChar)) == LIBSSH2_ERROR_EAGAIN);
-		if (rc) {
-			fprintf(stderr, "Authentication by password failed.\n");
-			return 1;
-		}
-	}
+    if (auth_pw & 1) {
+        /* We can authenticate via password */
+        if (libssh2_userauth_password(session, userChar, passwordChar)) {
+            printf("\tAuthentication by password failed!\n");
+            return 1;
+        } else {
+            printf("\tAuthentication by password succeeded.\n");
+        }
+    } else if (auth_pw & 2) {
+        /* Or via keyboard-interactive */
+        if (libssh2_userauth_keyboard_interactive(session, userChar, &keyboard_interactive) ) {
+            printf("\tAuthentication by keyboard-interactive failed!\n");
+            return 1;
+        } else {
+            printf("\tAuthentication by keyboard-interactive succeeded.\n");
+        }
+    } else if (auth_pw & 4) {
+        /* Or by public key */
+        if (libssh2_userauth_publickey_fromfile(session, userChar, keyfile1, keyfile2, passwordChar)) {
+            printf("\tAuthentication by public key failed!\n");
+            return 1;
+        } else {
+            printf("\tAuthentication by public key succeeded.\n");
+        }
+    } else {
+        printf("No supported authentication methods found!\n");
+        return 1;
+    }
+
+
+    libssh2_session_set_blocking(session, 0);    
 	return 0;
 }
 
